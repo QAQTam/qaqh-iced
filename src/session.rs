@@ -1019,6 +1019,50 @@ mod tests {
         assert!(state.turns[0].revision > revision_after_open);
     }
 
+    /// ② ToolProgress 的 16 KiB 滑窗:长输出只保留尾部。
+    #[test]
+    fn tool_progress_is_windowed() {
+        let mut state = SessionState::new("s");
+        state.apply_entry(&entry("t1", TimelineEvent::TurnOpened { user_text: "hi".into() }));
+        state.apply_entry(&entry(
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Tool,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                    reasoning_kind: None,
+                },
+            },
+        ));
+        let chunk = "y".repeat(8 * 1024);
+        for sequence in 0..64 {
+            state.apply_entry(&entry(
+                "t1",
+                TimelineEvent::ToolProgress {
+                    block_id: "b1".into(),
+                    chunk: chunk.clone(),
+                    truncated: false,
+                    stream: Some("stdout".into()),
+                    bytes_total: 0,
+                },
+            ));
+            let _ = sequence;
+        }
+        let Some(Turn { rounds, .. }) = state.turns.last() else { panic!("turn") };
+        let Block::Tool { progress, .. } = &rounds[0].blocks[0] else { panic!("tool block") };
+        // 64 × 8 KiB = 512 KiB 投喂;窗口常量 16 KiB(允许一个分块的越界余量)。
+        assert!(
+            progress.len() <= 16 * 1024 + 8 * 1024,
+            "progress 窗口失效:len={}",
+            progress.len()
+        );
+        assert!(progress.ends_with(&chunk), "必须保留尾部(最新输出)");
+    }
+
     /// ③ truncated_before 从权威页传播。
     #[test]
     fn truncated_before_propagates() {

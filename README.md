@@ -94,6 +94,21 @@ src/
   快照;dirty 判定 = 缓冲 ≠ 权威值(而非「碰过没」),`config.save` 与
   `profile.apply` 写后 daemon 广播重载,无需重启。
 
+## 测试
+
+```bash
+cargo test          # 单元测试(设置页/时间线 reducer)+ 长上下文压力测试
+```
+
+- **单元测试**(11 条):设置页脏字段/密钥守卫/值域、timeline reducer 的
+  输出截断/索引去重/revision 语义/progress 滑窗/truncated_before 传播。
+- **长上下文压力测试**(`tests/long_context_soak.rs`):5k 回合 / 13 万事件
+  的合成流,独占测试二进制 + 计数全局分配器,三条硬断言 —— CPU 耗时上界、
+  峰值分配上界、保留字节上界(阈值有算术:有界设计 ~40 MB vs 无界 ~90 MB+)。
+  `SOAK_DELTAS=0` / `SOAK_TOOLS=1000000` 环境变量可做变量分离归因。
+  **边界**:只覆盖 reducer 数据面;渲染帧率(lazy 生效)需真机体感,
+  纯单测无法证明。
+
 ## 与后端契约
 
 改 wire 类型后,由后端唯一入口导出 SDK 契约(见后端 README),本仓经

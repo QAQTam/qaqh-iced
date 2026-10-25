@@ -8,15 +8,9 @@
 //! 运行前提:后端 daemon 可用。没有 discovery 记录时会尝试按 qaqh-client 的
 //! 候选序自动拉起 `qaqh-daemon`(dev 布局指 `../qaqh-backend/target/debug`)。
 
-mod backend;
-mod message;
-mod session;
-mod settings;
-mod state;
-mod view;
-mod view_settings;
-
-use message::BridgeEvent;
+use qaqh_iced::backend;
+use qaqh_iced::message::BridgeEvent;
+use qaqh_iced::state;
 
 fn main() -> iced::Result {
     // GUI 程序双击启动时没有控制台;`QAQH_ICED_LOG=<path>` 时安装极简文件
