@@ -3,8 +3,9 @@
 //! 只消费投影后的状态(不碰协议类型);样式函数集中在 `style` 段,
 //! 颜色一律 `color!`(0.14 的宏按 u8 取值)。
 
-use iced::widget::{button, checkbox, column, container, markdown, radio, row, rule, scrollable,
-                   text, text_editor, text_input, Space};
+use iced::widget::markdown::{Bullet, Item};
+use iced::widget::{button, checkbox, column, container, lazy, markdown, radio, rich_text, row,
+                   rule, scrollable, text, text_editor, text_input, Space};
 use iced::{color, keyboard, Alignment, Element, Font, Length, Padding, Theme};
 
 use crate::message::Message;
@@ -244,6 +245,14 @@ fn filler() -> Space {
 fn transcript<'a>(state: &'a crate::session::SessionState) -> Element<'a, Message> {
     let mut list = column![].spacing(14);
 
+    if state.truncated_before {
+        list = list.push(
+            text("⏳ 更早的历史已归档 —— 超出当前会话窗口,翻页取不到(数据仍在 daemon 归档里)")
+                .size(12)
+                .color(color!(191, 166, 77)),
+        );
+    }
+
     if state.has_more {
         let label = if state.loading_older {
             "加载中…"
@@ -263,7 +272,12 @@ fn transcript<'a>(state: &'a crate::session::SessionState) -> Element<'a, Messag
     }
 
     for turn in &state.turns {
-        list = list.push(turn_view(turn));
+        // O(n) → O(活跃回合):依赖 (turn_id, revision) —— 回合内容每变一次
+        // revision +1,封口回合依赖冻结,lazy 直接复用上次产出的元素树。
+        list = list.push(lazy(
+            (turn.turn_id.as_str(), turn.revision),
+            move |_| turn_view(turn),
+        ));
     }
 
     if state.turns.is_empty() {
@@ -282,11 +296,16 @@ fn transcript<'a>(state: &'a crate::session::SessionState) -> Element<'a, Messag
         .into()
 }
 
-fn turn_view(turn: &Turn) -> Element<'_, Message> {
+/// 单回合的 **owned** 渲染(lazy 闭包产出必须是 'static 元素树)。
+///
+/// 依赖数据在构建时克隆成 owned(String / spans Arc / 工具卡克隆)——
+/// 只有该回合 revision 变化时才重建一次,所以克隆成本摊在变更上,
+/// 而不是每帧全量克隆(那是另一种 O(n)/帧)。
+fn turn_view(turn: &Turn) -> Element<'static, Message> {
     let mut items = column![].spacing(8);
 
     if !turn.user_text.is_empty() {
-        let bubble = container(text(turn.user_text.as_str()).size(14))
+        let bubble = container(text(turn.user_text.clone()).size(14))
             .padding(Padding::new(10.0))
             .max_width(560)
             .style(style::user_bubble);
@@ -323,17 +342,18 @@ fn turn_view(turn: &Turn) -> Element<'_, Message> {
     items.into()
 }
 
+/// 设置页 plan 预览仍走标准 markdown 视图(借用渲染,不进 lazy)。
 fn markdown_element(md: &iced::widget::markdown::Content) -> Element<'_, Message> {
     markdown::view(
         md.items(),
-        markdown::Settings::with_text_size(14, markdown::Style::from(Theme::Dark)),
+        markdown::Settings::with_text_size(13, markdown::Style::from(Theme::Dark)),
     )
     .map(Message::LinkClicked)
 }
 
-fn block_view(block: &Block) -> Element<'_, Message> {
+fn block_view(block: &Block) -> Element<'static, Message> {
     match block {
-        Block::Text { md, .. } => markdown_element(md),
+        Block::Text { md, .. } => owned_markdown(md.items()),
         Block::Reasoning { raw, state, .. } => {
             if raw.trim().is_empty() {
                 return Space::new().height(0).into();
@@ -345,26 +365,134 @@ fn block_view(block: &Block) -> Element<'_, Message> {
             };
             container(
                 column![
-                    text(marker).size(11).color(color!(128, 135, 148)),
-                    text(raw.as_str()).size(12).color(color!(158, 166, 178)),
+                    text(marker.to_string()).size(11).color(color!(128, 135, 148)),
+                    text(raw.clone()).size(12).color(color!(158, 166, 178)),
                 ]
                 .spacing(2),
             )
-            .padding(Padding::new(10.0).left(12))
+            .padding(Padding::new(10.0).left(12.0))
             .style(style::card)
             .width(Length::Fill)
             .into()
         }
         Block::Tool { tool, progress, .. } => tool_card(tool, progress),
-        Block::Notice { text: body, .. } => text(body.as_str())
+        Block::Notice { text: body, .. } => text(body.clone())
             .size(12)
             .color(color!(153, 161, 173))
             .into(),
     }
 }
 
-/// 工具调用卡:状态图标 + 标题行 + (可选)输出窗口。
-fn tool_card<'a>(tool: &'a qaqh_client::TimelineTool, progress: &'a str) -> Element<'a, Message> {
+// ── owned markdown:lazy 内的 'static markdown 渲染 ──
+//
+// `markdown::view` 借用 items,进不了 lazy 的 Element<'static> 约束。
+// 这里的关键观察:`markdown::Text::spans(style)` 返回 **owned 的**
+// `Arc<[Span<'static, Uri>]>`(行内样式/链接全保真),所以块级外观
+// 自己搭、行内内容走 spans,即可全 owned。块级外观对聊天场景做了
+// 合理简化(标题字号、代码块容器、列表缩进;表格降级为行)。
+
+const MD_BASE: f32 = 14.0;
+
+fn md_style() -> markdown::Style {
+    markdown::Style::from(Theme::Dark)
+}
+
+fn md_rich(text: &markdown::Text, size: f32) -> Element<'static, Message> {
+    rich_text(text.spans(md_style()))
+        .size(size)
+        .on_link_click(Message::LinkClicked)
+        .into()
+}
+
+fn owned_markdown(items: &[Item]) -> Element<'static, Message> {
+    owned_items(items, 0, MD_BASE)
+}
+
+fn owned_items(items: &[Item], depth: usize, base: f32) -> Element<'static, Message> {
+    let mut column_ = column![].spacing(base * 0.55);
+    for item in items {
+        column_ = column_.push(owned_item(item, depth, base));
+    }
+    column_.into()
+}
+
+fn owned_item(item: &Item, depth: usize, base: f32) -> Element<'static, Message> {
+    match item {
+        Item::Heading(level, text) => {
+            let size = match level {
+                markdown::HeadingLevel::H1 => base + 6.0,
+                markdown::HeadingLevel::H2 => base + 4.0,
+                markdown::HeadingLevel::H3 => base + 2.0,
+                _ => base,
+            };
+            md_rich(text, size)
+        }
+        Item::Paragraph(text) => md_rich(text, base),
+        Item::CodeBlock { lines, .. } => {
+            let mut block = column![].spacing(1);
+            for line in lines {
+                let code_line: Element<'static, Message> = rich_text(line.spans(md_style()))
+                    .font(Font::MONOSPACE)
+                    .size(base - 2.0)
+                    .on_link_click(Message::LinkClicked)
+                    .into();
+                block = block.push(code_line);
+            }
+            container(block.padding(8.0))
+                .width(Length::Fill)
+                .style(style::card)
+                .into()
+        }
+        Item::List { bullets, .. } => {
+            let mut list = column![].spacing(3);
+            for bullet in bullets {
+                let marker = match bullet {
+                    Bullet::Task { done: true, .. } => "☑",
+                    Bullet::Task { .. } => "☐",
+                    Bullet::Point { .. } => "•",
+                };
+                let content = match bullet {
+                    Bullet::Point { items } | Bullet::Task { items, .. } => {
+                        owned_items(items, depth + 1, base)
+                    }
+                };
+                list = list.push(
+                    row![
+                        text(marker.to_string())
+                            .size(base - 1.0)
+                            .color(color!(140, 148, 161)),
+                        content,
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Start),
+                );
+            }
+            container(list)
+            .padding(Padding::new(0.0).left(14.0 * depth.min(1) as f32))
+            .into()
+        }
+        Item::Quote(items) => container(owned_items(items, depth, base - 0.5))
+            .padding(Padding::new(8.0).left(12.0))
+            .style(style::card)
+            .width(Length::Fill)
+            .into(),
+        Item::Image { url, alt, .. } => column![
+            md_rich(alt, base),
+            text(url.clone())
+                .size(base - 3.0)
+                .color(color!(120, 127, 138)),
+        ]
+        .spacing(2)
+        .into(),
+        Item::Rule => rule::horizontal(1.0).into(),
+        // 表格:Row.cells 是私有的,公共 API 渲染不了 —— 聊天输出里罕见,
+        // 降级为占位说明(设置页的 plan 预览走标准 markdown::view,不受此限)。
+        Item::Table { .. } => text("[表格内容请参考原文]").size(base - 2.0).into(),
+    }
+}
+
+/// 工具调用卡:状态图标 + 标题行 + (可选)输出窗口。owned 版本。
+fn tool_card(tool: &qaqh_client::TimelineTool, progress: &str) -> Element<'static, Message> {
     let (icon, icon_color) = match tool.state {
         qaqh_client::TimelineToolState::Prepared
         | qaqh_client::TimelineToolState::Running => ("◐", color!(140, 166, 242)),
@@ -448,7 +576,7 @@ fn tool_card<'a>(tool: &'a qaqh_client::TimelineTool, progress: &'a str) -> Elem
         );
     }
 
-    container(card.padding(8))
+    container(card.padding(8.0))
         .width(Length::Fill)
         .max_width(760)
         .style(style::card)

@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 # GUI 框架(当前最新稳定版)。wgpu 渲染失败时自动回退 tiny-skia 软件渲染。
 # `tokio` 让 iced 的 async executor 跑在 tokio 上;`markdown` 用于助手文本块。
-iced = { version = "0.14", features = ["tokio", "markdown"] }
+iced = { version = "0.14", features = ["tokio", "markdown", "lazy"] }
 # 传输层权威实现(与 qaqh-tui-app 同款 path 依赖):发现/lease/open、
 # per-seed 单流与 timeline 流、命令面与服务面全部由它承担,本仓不自建。
 qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }

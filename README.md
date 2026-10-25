@@ -76,6 +76,17 @@ src/
 - **v2 事件准入闸**沿用 TUI 不变量:epoch 校验、`(fact_seq,
   projection_index)` 字典序单调、replaceable 按 revision、重复/倒退丢弃;
   未决交互按身份记账(终态不得重开,应答过的同 id 请求不再弹面板)。
+- **渲染与内存复杂度**:
+  - 回合级 `lazy`(`(turn_id, revision)` 依赖):回合内容每次变更
+    `revision +1`,封口回合依赖冻结、永不重建 —— 帧成本从
+    O(全部已加载块) 降为 O(活跃回合);活跃回合内 markdown 走 owned
+    渲染器(`Text::spans()` 产出的 `Arc<[Span<'static>]>` 保证行内样式
+    /链接零损失;块级外观简化,表格降级为占位)。
+  - 工具输出在落账时裁到 16 KiB 尾窗(`output` 与 `display.body` 族),
+    UI 只展示尾部,内存不随输出体量增长。
+  - 事件定位走 turn_id → 下标索引(重建于整页替换/前插),流式路径 O(1)。
+  - `truncated_before` 如实上屏:物化窗口取不到的更早历史明确告知,
+    而不是让「加载更早」无声失效。
 - timeline 流断开重连由传输层自愈;只有 daemon 明确 404(会话不存在)才
   下线本地状态。
 - 设置读写闭环对齐 TUI:`config.load` → 缓冲 → 只发脏字段的

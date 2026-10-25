@@ -26,14 +26,13 @@ pub struct Round {
     pub blocks: Vec<Block>,
 }
 
-/// 转录块。文本块同时持有原文与增量解析的 markdown 视图。
+/// 转录块。文本块持有增量解析的 markdown 视图(渲染层转 owned 元素)。
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // Text 变体大是本质:markdown 视图就地缓存
 pub enum Block {
     Text {
         id: String,
         state: TimelineBlockState,
-        raw: String,
         md: iced::widget::markdown::Content,
     },
     Reasoning {
@@ -68,7 +67,6 @@ impl Block {
             TimelineBlockKind::Text => Block::Text {
                 id: block.block_id.clone(),
                 state,
-                raw: block.text.clone(),
                 md: iced::widget::markdown::Content::parse(&block.text),
             },
             TimelineBlockKind::Reasoning => Block::Reasoning {
@@ -76,9 +74,8 @@ impl Block {
                 state,
                 raw: block.text.clone(),
             },
-            TimelineBlockKind::Tool => Block::Tool {
-                id: block.block_id.clone(),
-                tool: block.tool.clone().unwrap_or_else(|| TimelineTool {
+            TimelineBlockKind::Tool => {
+                let tool = block.tool.clone().unwrap_or_else(|| TimelineTool {
                     tool_call_id: block.block_id.clone(),
                     name: String::new(),
                     state: qaqh_client::TimelineToolState::Prepared,
@@ -95,14 +92,18 @@ impl Block {
                     permission: None,
                     exit_code: None,
                     completed_at_ms: None,
-                }),
-                // TimelineBlock 本身没有 progress 槽,从 tool 里取。
-                progress: block
-                    .tool
-                    .as_ref()
-                    .map(|tool| tool.progress.clone())
-                    .unwrap_or_default(),
-            },
+                });
+                Block::Tool {
+                    id: block.block_id.clone(),
+                    // TimelineBlock 本身没有 progress 槽,从 tool 里取。
+                    progress: block
+                        .tool
+                        .as_ref()
+                        .map(|tool| tool.progress.clone())
+                        .unwrap_or_default(),
+                    tool: bound_tool(tool),
+                }
+            }
             TimelineBlockKind::Notice => Block::Notice {
                 id: block.block_id.clone(),
                 text: block.text.clone(),
@@ -113,10 +114,7 @@ impl Block {
     /// 追加流式文本增量。
     fn append_text(&mut self, delta: &str) {
         match self {
-            Block::Text { raw, md, .. } => {
-                raw.push_str(delta);
-                md.push_str(delta);
-            }
+            Block::Text { md, .. } => md.push_str(delta),
             Block::Reasoning { raw, .. } => raw.push_str(delta),
             _ => {}
         }
@@ -125,10 +123,7 @@ impl Block {
     /// 用整段文本覆盖(checkpoint 全量形态)。
     fn replace_text(&mut self, text: &str) {
         match self {
-            Block::Text { raw, md, .. } => {
-                *raw = text.to_string();
-                *md = iced::widget::markdown::Content::parse(text);
-            }
+            Block::Text { md, .. } => *md = iced::widget::markdown::Content::parse(text),
             Block::Reasoning { raw, .. } => *raw = text.to_string(),
             _ => {}
         }
@@ -154,6 +149,10 @@ pub struct Turn {
     pub state: TimelineTurnState,
     pub failure: Option<TimelineFailure>,
     pub rounds: Vec<Round>,
+    /// 渲染缓存代数:本回合内容每被改动一次就 +1。lazy 视图以
+    /// `(turn_id, revision)` 为依赖 —— 封口回合停止增长,永不重建;
+    /// 活跃回合随流式增量逐帧重建(这是唯一该重建的)。
+    pub revision: u64,
 }
 
 impl Turn {
@@ -164,6 +163,7 @@ impl Turn {
             user_text: turn.user_text.clone(),
             state: turn.state,
             failure: turn.failure.clone(),
+            revision: 0,
             rounds: turn
                 .rounds
                 .iter()
@@ -188,6 +188,43 @@ impl Turn {
         });
         self.rounds.last_mut().expect("just pushed")
     }
+}
+
+/// 前端投影里工具输出的保留上限(UI 只展示尾部窗口;磁盘归档是事实源)。
+const TOOL_OUTPUT_WINDOW: usize = 16 * 1024;
+
+/// 把工具输出族字段裁到尾部窗口,UTF-8 边界安全。语义无损:
+/// 渲染层本来就只取尾部 ~1.6k 字符,这里拦的是内存而不是像素。
+fn bound_tool(mut tool: TimelineTool) -> TimelineTool {
+    if let Some(output) = &mut tool.output {
+        *output = tail_window(output, TOOL_OUTPUT_WINDOW);
+    }
+    if let Some(display) = &mut tool.display {
+        match &mut display.body {
+            Some(qaqh_client::TimelineToolBody::Text { text, .. }) => {
+                *text = tail_window(text, TOOL_OUTPUT_WINDOW);
+            }
+            Some(qaqh_client::TimelineToolBody::Shell { output, .. }) => {
+                *output = tail_window(output, TOOL_OUTPUT_WINDOW);
+            }
+            Some(qaqh_client::TimelineToolBody::Streams { stdout, stderr, .. }) => {
+                *stdout = tail_window(stdout, TOOL_OUTPUT_WINDOW);
+                *stderr = tail_window(stderr, TOOL_OUTPUT_WINDOW);
+            }
+            _ => {}
+        }
+    }
+    tool
+}
+
+/// 取尾部至多 `max_chars` 个字符(超长时以 … 起头)。
+fn tail_window(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().skip(count - max_chars).collect();
+    format!("…{truncated}")
 }
 
 // ───────────────────────── 挂起交互面板 ─────────────────────────
@@ -379,6 +416,10 @@ pub fn parse_interaction_body(
 pub struct SessionState {
     pub session_id: String,
     pub title: String,
+    /// turn_id → turns 下标(事件定位 O(1);prepend/整页替换时重建)。
+    turn_positions: std::collections::HashMap<String, usize>,
+    /// daemon 物化窗口未覆盖历史开头(更早回合存在但翻页取不到)。
+    pub truncated_before: bool,
     // v2 时序闸(对齐 TUI ringing_v2.rs 的不变量)
     pub server_epoch: Option<String>,
     pub log_id: Option<String>,
@@ -410,6 +451,8 @@ impl SessionState {
         Self {
             session_id: session_id.into(),
             title: String::new(),
+            turn_positions: std::collections::HashMap::new(),
+            truncated_before: false,
             server_epoch: None,
             log_id: None,
             cursor: None,
@@ -542,9 +585,18 @@ impl SessionState {
     /// 权威快照整页替换(激活/重定基)。
     pub fn apply_page(&mut self, page: &TimelinePage) {
         self.turns = page.snapshot.turns.iter().map(Turn::from_timeline).collect();
+        self.rebuild_turn_positions();
         self.has_more = page.has_more;
         self.total_turns = page.total_turns;
+        self.truncated_before = page.truncated_before;
         self.loading_older = false;
+    }
+
+    fn rebuild_turn_positions(&mut self) {
+        self.turn_positions.clear();
+        for (index, turn) in self.turns.iter().enumerate() {
+            self.turn_positions.insert(turn.turn_id.clone(), index);
+        }
     }
 
     /// 更早的历史页前插(去重)。
@@ -559,7 +611,10 @@ impl SessionState {
             .collect();
         let count = older.len();
         self.turns.splice(0..0, older);
+        self.rebuild_turn_positions();
         self.has_more = page.has_more;
+        // 新 fetched 的更旧页自己的标志描述「合并后窗口」的开头状态。
+        self.truncated_before = page.truncated_before;
         self.loading_older = false;
         if count == 0 {
             self.has_more = false;
@@ -570,7 +625,7 @@ impl SessionState {
     pub fn apply_entry(&mut self, entry: &TimelineEntry) {
         match &entry.event {
             TimelineEvent::TurnOpened { user_text } => {
-                if !self.turns.iter().any(|turn| turn.turn_id == entry.turn_id) {
+                if !self.turn_positions.contains_key(&entry.turn_id) {
                     self.turns.push(Turn {
                         turn_id: entry.turn_id.clone(),
                         turn_index: None,
@@ -578,11 +633,15 @@ impl SessionState {
                         state: TimelineTurnState::Running,
                         failure: None,
                         rounds: Vec::new(),
+                        revision: 0,
                     });
+                    self.turn_positions
+                        .insert(entry.turn_id.clone(), self.turns.len() - 1);
                 } else if let Some(turn) = self.turn_mut(&entry.turn_id)
                     && turn.user_text.is_empty()
                 {
                     turn.user_text = user_text.clone();
+                    self.touch(&entry.turn_id);
                 }
             }
             TimelineEvent::BlockOpened { block } => {
@@ -592,6 +651,7 @@ impl SessionState {
                     if !round.blocks.iter().any(|existing| existing.id() == block.block_id)
                     {
                         round.blocks.push(Block::from_timeline(block));
+                        self.touch(&entry.turn_id);
                     }
                 }
             }
@@ -600,6 +660,7 @@ impl SessionState {
             } => {
                 if let Some(block) = self.block_mut(&entry.turn_id, block_id) {
                     block.append_text(delta);
+                    self.touch(&entry.turn_id);
                 }
             }
             TimelineEvent::BlockCheckpoint {
@@ -611,13 +672,15 @@ impl SessionState {
                     } else if !text.is_empty() {
                         block.replace_text(text);
                     }
+                    self.touch(&entry.turn_id);
                 }
             }
             TimelineEvent::ToolUpdated { block_id, tool } => {
                 if let Some(Block::Tool { tool: slot, .. }) =
                     self.block_mut(&entry.turn_id, block_id)
                 {
-                    *slot = tool.clone();
+                    *slot = bound_tool(tool.clone());
+                    self.touch(&entry.turn_id);
                 }
             }
             TimelineEvent::ToolProgress { block_id, chunk, .. } => {
@@ -633,11 +696,13 @@ impl SessionState {
                             .unwrap_or(progress.len());
                         progress.drain(..boundary);
                     }
+                    self.touch(&entry.turn_id);
                 }
             }
             TimelineEvent::BlockSealed { block_id } => {
                 if let Some(block) = self.block_mut(&entry.turn_id, block_id) {
                     block.seal();
+                    self.touch(&entry.turn_id);
                 }
             }
             TimelineEvent::RoundSealed { is_final } => {
@@ -654,12 +719,14 @@ impl SessionState {
                             block.seal();
                         }
                     }
+                    self.touch(&entry.turn_id);
                 }
             }
             TimelineEvent::TurnSealed { state, failure } => {
                 if let Some(turn) = self.turn_mut(&entry.turn_id) {
                     turn.state = *state;
                     turn.failure = failure.clone();
+                    self.touch(&entry.turn_id);
                 }
             }
             TimelineEvent::UsageSampled { usage } => {
@@ -670,11 +737,15 @@ impl SessionState {
     }
 
     fn turn_mut(&mut self, turn_id: &str) -> Option<&mut Turn> {
-        // 流式事件几乎总作用于最后一个回合;倒序查找便宜且常见路径 O(1)。
-        self.turns
-            .iter_mut()
-            .rev()
-            .find(|turn| turn.turn_id == turn_id)
+        let index = *self.turn_positions.get(turn_id)?;
+        self.turns.get_mut(index)
+    }
+
+    /// 记一次回合内容变更(渲染缓存代数 +1)。
+    fn touch(&mut self, turn_id: &str) {
+        if let Some(turn) = self.turn_mut(turn_id) {
+            turn.revision = turn.revision.wrapping_add(1);
+        }
     }
 
     fn block_mut(&mut self, turn_id: &str, block_id: &str) -> Option<&mut Block> {
@@ -821,5 +892,148 @@ impl SessionState {
         } else {
             self.title.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qaqh_client::TimelineEvent;
+
+    fn entry(turn_id: &str, event: TimelineEvent) -> TimelineEntry {
+        TimelineEntry {
+            timeline_seq: 1,
+            turn_id: turn_id.to_string(),
+            round_num: Some(0),
+            event,
+        }
+    }
+
+    fn tool_output(output: &str) -> TimelineEvent {
+        TimelineEvent::ToolUpdated {
+            block_id: "b1".into(),
+            tool: TimelineTool {
+                tool_call_id: "c1".into(),
+                name: "exec".into(),
+                state: qaqh_client::TimelineToolState::Succeeded,
+                summary: None,
+                args_json: None,
+                output: Some(output.to_string()),
+                diff: None,
+                progress: String::new(),
+                progress_truncated: false,
+                progress_stream: None,
+                progress_bytes_total: 0,
+                display: None,
+                failure: None,
+                permission: None,
+                exit_code: None,
+                completed_at_ms: None,
+            },
+        }
+    }
+
+    /// ② 工具输出在落账时就被裁到尾窗(UI 只展示尾部;磁盘是事实源)。
+    #[test]
+    fn tool_output_is_bounded() {
+        let mut state = SessionState::new("s");
+        state.apply_entry(&entry("t1", TimelineEvent::TurnOpened { user_text: "hi".into() }));
+        state.apply_entry(&entry(
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Tool,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                    reasoning_kind: None,
+                },
+            },
+        ));
+        let huge = "x".repeat(200_000);
+        state.apply_entry(&entry("t1", tool_output(&huge)));
+        let Some(Turn { rounds, .. }) = state.turns.last() else {
+            panic!("turn");
+        };
+        let Block::Tool { tool, .. } = &rounds[0].blocks[0] else {
+            panic!("tool block");
+        };
+        let output = tool.output.as_deref().expect("output");
+        assert!(output.chars().count() <= TOOL_OUTPUT_WINDOW + 1, "len={}", output.chars().count());
+        assert!(output.starts_with('…'));
+    }
+
+    /// ④ TurnOpened 去重走索引;后续事件经索引定位。
+    #[test]
+    fn turn_opened_is_indexed() {
+        let mut state = SessionState::new("s");
+        state.apply_entry(&entry("t1", TimelineEvent::TurnOpened { user_text: "a".into() }));
+        state.apply_entry(&entry("t1", TimelineEvent::TurnOpened { user_text: "a".into() }));
+        assert_eq!(state.turns.len(), 1);
+        // 索引可定位:TextDelta 正常生效
+        state.apply_entry(&entry(
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                    reasoning_kind: None,
+                },
+            },
+        ));
+        state.apply_entry(&entry(
+            "t1",
+            TimelineEvent::TextDelta { block_id: "b1".into(), fragment_seq: 1, delta: "hello".into() },
+        ));
+        let Some(Turn { rounds, .. }) = state.turns.last() else { panic!("turn") };
+        let Block::Text { md, .. } = &rounds[0].blocks[0] else { panic!("text block") };
+        assert_eq!(md.items().len(), 1);
+    }
+
+    /// ① revision 随内容变更单调;无内容变更不动。
+    #[test]
+    fn revision_tracks_mutations() {
+        let mut state = SessionState::new("s");
+        state.apply_entry(&entry("t1", TimelineEvent::TurnOpened { user_text: "a".into() }));
+        let revision_after_open = state.turns[0].revision;
+        state.apply_entry(&entry("t1", TimelineEvent::UsageSampled {
+            usage: qaqh_client::UsageInfo::default(),
+        }));
+        assert_eq!(state.turns[0].revision, revision_after_open, "usage 不改回合内容");
+        state.apply_entry(&entry(
+            "t1",
+            TimelineEvent::TextDelta { block_id: "b1".into(), fragment_seq: 1, delta: "x".into() },
+        ));
+        // 未知块的 delta 不生效也不 bump
+        assert_eq!(state.turns[0].revision, revision_after_open);
+        state.apply_entry(&entry("t1", TimelineEvent::TurnSealed {
+            state: TimelineTurnState::Completed,
+            failure: None,
+        }));
+        assert!(state.turns[0].revision > revision_after_open);
+    }
+
+    /// ③ truncated_before 从权威页传播。
+    #[test]
+    fn truncated_before_propagates() {
+        let mut state = SessionState::new("s");
+        let page = qaqh_client::TimelinePage {
+            schema: qaqh_client::RINGING_SCHEMA.into(),
+            version: qaqh_client::RINGING_V2_VERSION,
+            server_epoch: "e".into(),
+            session_id: "s".into(),
+            snapshot: qaqh_client::TimelineSnapshot { watermark: 0, turns: vec![] },
+            has_more: false,
+            total_turns: 0,
+            truncated_before: true,
+        };
+        state.apply_page(&page);
+        assert!(state.truncated_before);
     }
 }
